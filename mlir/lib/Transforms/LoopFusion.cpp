@@ -956,6 +956,65 @@ static Value createPrivateMemRef(AffineForOp forOp, Operation *srcStoreOpInst,
   return newMemRef;
 }
 
+static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
+                                       Value memref,
+                                       MemRefDependenceGraph *mdg) {
+  auto *srcNode = mdg->getNode(srcId);
+  auto *dstNode = mdg->getNode(dstId);
+  auto userRange = memref.getUsers();
+  for (auto &idAndNode : mdg->nodes) {
+    auto *op = idAndNode.second.op;
+    if (!isa<AffineForOp>(*op))
+      continue;
+    // Take care of nodes between srcNode and dstNode
+    if (srcNode->op->isBeforeInBlock(op) && op->isBeforeInBlock(dstNode->op)) {
+      // Walk inside the ForOp to find any use of the memref.
+      bool found = false;
+      op->walk([&](Operation *myop) {
+        // Skip affine ops
+        if (isMemRefDereferencingOp(*myop))
+          return WalkResult::advance();
+        // Find any non-affine ops that use the memref
+        if (std::find(userRange.begin(), userRange.end(), myop) !=
+            userRange.end()) {
+          found = true;
+          LLVM_DEBUG(llvm::dbgs() << "tung found\n");
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (found)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
+                                       MemRefDependenceGraph *mdg) {
+  // Collect Values in node 'srcId'.
+  auto *srcNode = mdg->getNode(srcId);
+  SmallVector<Value, 2> values;
+  srcNode->op->walk([&](Operation *op) {
+    // Skip affine ops
+    if (isa<AffineForOp>(op))
+      return WalkResult::advance();
+    for (Value v : op->getOperands()) {
+      if (std::find(values.begin(), values.end(), v) != values.end())
+        continue;
+      else
+        values.push_back(v);
+    }
+    return WalkResult::advance();
+  });
+  for (Value v : values) {
+    bool found = hasNonAffineUsersOnThePath(srcId, dstId, v, mdg);
+    if (found)
+      return true;
+  }
+  return false;
+}
+
 // Checks if node 'srcId' can be safely fused into node 'dstId'. Node 'srcId'
 // may write to multiple memrefs but it is required that only one of them,
 // 'srcLiveOutStoreOp', has output edges.
@@ -1015,6 +1074,16 @@ static bool canFuseSrcWhichWritesToLiveOut(unsigned srcId, unsigned dstId,
   // TODO(andydavis) Check the shape and lower bounds here too.
   if (srcNumElements != dstNumElements)
     return false;
+
+  // Return false if 'memref' is used by non-affine load/store ops whose region
+  // is between srcRegion and dstRegion.
+  // Walking from 'srcNode' to 'dstNode', if there is a use of 'memref' that is
+  // non-affine load/store ops, return false.
+  // if (hasNonAffineUsersOnThePath(srcId, dstId, memref, mdg))
+  if (hasNonAffineUsersOnThePath(srcId, dstId, mdg))
+    return false;
+  LLVM_DEBUG(llvm::dbgs() << "tung can fuse src-dst\n");
+
   return true;
 }
 
@@ -1789,6 +1858,10 @@ public:
       }
       if (storeMemrefs.size() != 1)
         return false;
+      if (hasNonAffineUsersOnThePath(dstNode->id, sibNode->id, mdg) ||
+          hasNonAffineUsersOnThePath(sibNode->id, dstNode->id, mdg))
+        return false;
+      LLVM_DEBUG(llvm::dbgs() << "tung can fuse siblings\n");
       return true;
     };
 
