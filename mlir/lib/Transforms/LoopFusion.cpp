@@ -1852,6 +1852,9 @@ public:
       }
       if (storeMemrefs.size() != 1)
         return false;
+
+      // Skip if a value in one node is used by a non-affine operation that lies
+      // between 'dstNode' and 'sibNode'.
       if (hasNonAffineUsersOnThePath(dstNode->id, sibNode->id, mdg) ||
           hasNonAffineUsersOnThePath(sibNode->id, dstNode->id, mdg))
         return false;
