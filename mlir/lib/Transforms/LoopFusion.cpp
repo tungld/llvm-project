@@ -956,29 +956,27 @@ static Value createPrivateMemRef(AffineForOp forOp, Operation *srcStoreOpInst,
   return newMemRef;
 }
 
+// Walking from node 'srcId' to node 'dstId', if there is a use of 'memref' that
+// is a non-affine operation, return false.
 static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
                                        Value memref,
                                        MemRefDependenceGraph *mdg) {
   auto *srcNode = mdg->getNode(srcId);
   auto *dstNode = mdg->getNode(dstId);
-  auto userRange = memref.getUsers();
+  auto users = memref.getUsers();
   for (auto &idAndNode : mdg->nodes) {
     auto *op = idAndNode.second.op;
-    if (!isa<AffineForOp>(*op))
-      continue;
-    // Take care of nodes between srcNode and dstNode
+    // Take care of operations between srcNode and dstNode.
     if (srcNode->op->isBeforeInBlock(op) && op->isBeforeInBlock(dstNode->op)) {
-      // Walk inside the ForOp to find any use of the memref.
+      // Walk inside the operation to find any use of the memref.
       bool found = false;
-      op->walk([&](Operation *myop) {
-        // Skip affine ops
-        if (isMemRefDereferencingOp(*myop))
+      op->walk([&](Operation *user) {
+        // Skip affine ops.
+        if (isMemRefDereferencingOp(*user))
           return WalkResult::advance();
-        // Find any non-affine ops that use the memref
-        if (std::find(userRange.begin(), userRange.end(), myop) !=
-            userRange.end()) {
+        // Find a non-affine op that uses the memref.
+        if (std::find(users.begin(), users.end(), user) != users.end()) {
           found = true;
-          LLVM_DEBUG(llvm::dbgs() << "tung found\n");
           return WalkResult::interrupt();
         }
         return WalkResult::advance();
@@ -990,9 +988,11 @@ static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
   return false;
 }
 
+// Check whether a value in node 'srcId' has a non-affine consumer that is
+// between node 'srcId' and node 'dstId'.
 static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
                                        MemRefDependenceGraph *mdg) {
-  // Collect Values in node 'srcId'.
+  // Collect values in node 'srcId'.
   auto *srcNode = mdg->getNode(srcId);
   SmallVector<Value, 2> values;
   srcNode->op->walk([&](Operation *op) {
@@ -1000,16 +1000,14 @@ static bool hasNonAffineUsersOnThePath(unsigned srcId, unsigned dstId,
     if (isa<AffineForOp>(op))
       return WalkResult::advance();
     for (Value v : op->getOperands()) {
-      if (std::find(values.begin(), values.end(), v) != values.end())
-        continue;
-      else
+      if (std::find(values.begin(), values.end(), v) == values.end())
         values.push_back(v);
     }
     return WalkResult::advance();
   });
+  // Looking for users between node 'srcId' and node 'dstId'.
   for (Value v : values) {
-    bool found = hasNonAffineUsersOnThePath(srcId, dstId, v, mdg);
-    if (found)
+    if (hasNonAffineUsersOnThePath(srcId, dstId, v, mdg))
       return true;
   }
   return false;
@@ -1075,14 +1073,10 @@ static bool canFuseSrcWhichWritesToLiveOut(unsigned srcId, unsigned dstId,
   if (srcNumElements != dstNumElements)
     return false;
 
-  // Return false if 'memref' is used by non-affine load/store ops whose region
-  // is between srcRegion and dstRegion.
-  // Walking from 'srcNode' to 'dstNode', if there is a use of 'memref' that is
-  // non-affine load/store ops, return false.
-  // if (hasNonAffineUsersOnThePath(srcId, dstId, memref, mdg))
+  // Return false if 'memref' is used by a non-affine operation that is
+  // between node 'srcId' and node 'dstId'.
   if (hasNonAffineUsersOnThePath(srcId, dstId, mdg))
     return false;
-  LLVM_DEBUG(llvm::dbgs() << "tung can fuse src-dst\n");
 
   return true;
 }
@@ -1861,7 +1855,6 @@ public:
       if (hasNonAffineUsersOnThePath(dstNode->id, sibNode->id, mdg) ||
           hasNonAffineUsersOnThePath(sibNode->id, dstNode->id, mdg))
         return false;
-      LLVM_DEBUG(llvm::dbgs() << "tung can fuse siblings\n");
       return true;
     };
 
