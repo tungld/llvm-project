@@ -64,6 +64,50 @@ mlir::edsc::AffineLoopNestBuilder::AffineLoopNestBuilder(Value *iv,
   loops.emplace_back(makeAffineLoopBuilder(iv, lbs, ubs, step));
 }
 
+void mlir::edsc::affineLoopNestBuilder(
+    ValueRange lbs, ValueRange ubs, ArrayRef<int64_t> steps,
+    function_ref<void(ValueRange)> bodyBuilderFn) {
+  assert(ScopedContext::getContext() && "EDSC ScopedContext not set up");
+
+  // Wrap the body builder function into an interface compatible with the main
+  // builder.
+  auto wrappedBuilderFn = [&](OpBuilder &nestedBuilder, Location nestedLoc,
+                              ValueRange ivs) {
+    ScopedContext context(nestedBuilder, nestedLoc);
+    bodyBuilderFn(ivs);
+  };
+  function_ref<void(OpBuilder &, Location, ValueRange)> wrapper;
+  if (bodyBuilderFn)
+    wrapper = wrappedBuilderFn;
+
+  // Extract the builder, location and construct the loop nest.
+  OpBuilder &builder = ScopedContext::getBuilderRef();
+  Location loc = ScopedContext::getLocation();
+  buildAffineLoopNest(builder, loc, lbs, ubs, steps, wrapper);
+}
+
+void mlir::edsc::affineLoopBuilder(ValueRange lbs, ValueRange ubs, int64_t step,
+                                   function_ref<void(Value)> bodyBuilderFn) {
+  // Fetch the builder and location.
+  assert(ScopedContext::getContext() && "EDSC ScopedContext not set up");
+  OpBuilder &builder = ScopedContext::getBuilderRef();
+  Location loc = ScopedContext::getLocation();
+
+  // Create the actual loop and call the body builder, if provided, after
+  // updating the scoped context.
+  builder.create<AffineForOp>(
+      loc, lbs, builder.getMultiDimIdentityMap(lbs.size()), ubs,
+      builder.getMultiDimIdentityMap(ubs.size()), step,
+      [&](OpBuilder &nestedBuilder, Location nestedLoc, Value iv) {
+        if (bodyBuilderFn) {
+          ScopedContext nestedContext(nestedBuilder, nestedLoc);
+          OpBuilder::InsertionGuard guard(nestedBuilder);
+          bodyBuilderFn(iv);
+        }
+        nestedBuilder.create<AffineTerminatorOp>(nestedLoc);
+      });
+}
+
 mlir::edsc::AffineLoopNestBuilder::AffineLoopNestBuilder(
     MutableArrayRef<Value> ivs, ArrayRef<Value> lbs, ArrayRef<Value> ubs,
     ArrayRef<int64_t> steps) {

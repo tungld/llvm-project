@@ -81,7 +81,7 @@ const char *SelectInst::areInvalidOperands(Value *Op0, Value *Op1, Value *Op2) {
     VectorType *ET = dyn_cast<VectorType>(Op1->getType());
     if (!ET)
       return "selected values for vector select must be vectors";
-    if (ET->getNumElements() != VT->getNumElements())
+    if (ET->getElementCount() != VT->getElementCount())
       return "vector select requires selected vectors to have "
                    "the same vector length as select condition";
   } else if (Op0->getType() != Type::getInt1Ty(Op0->getContext())) {
@@ -330,13 +330,13 @@ bool CallBase::paramHasAttr(unsigned ArgNo, Attribute::AttrKind Kind) const {
 
 bool CallBase::hasFnAttrOnCalledFunction(Attribute::AttrKind Kind) const {
   if (const Function *F = getCalledFunction())
-    return F->getAttributes().hasAttribute(AttributeList::FunctionIndex, Kind);
+    return F->getAttributes().hasFnAttribute(Kind);
   return false;
 }
 
 bool CallBase::hasFnAttrOnCalledFunction(StringRef Kind) const {
   if (const Function *F = getCalledFunction())
-    return F->getAttributes().hasAttribute(AttributeList::FunctionIndex, Kind);
+    return F->getAttributes().hasFnAttribute(Kind);
   return false;
 }
 
@@ -1246,6 +1246,15 @@ static Value *getAISize(LLVMContext &Context, Value *Amt) {
   return Amt;
 }
 
+static Align computeAllocaDefaultAlign(Type *Ty, BasicBlock *BB) {
+  const DataLayout &DL = BB->getModule()->getDataLayout();
+  return DL.getPrefTypeAlign(Ty);
+}
+
+static Align computeAllocaDefaultAlign(Type *Ty, Instruction *I) {
+  return computeAllocaDefaultAlign(Ty, I->getParent());
+}
+
 AllocaInst::AllocaInst(Type *Ty, unsigned AddrSpace, const Twine &Name,
                        Instruction *InsertBefore)
   : AllocaInst(Ty, AddrSpace, /*ArraySize=*/nullptr, Name, InsertBefore) {}
@@ -1256,27 +1265,29 @@ AllocaInst::AllocaInst(Type *Ty, unsigned AddrSpace, const Twine &Name,
 
 AllocaInst::AllocaInst(Type *Ty, unsigned AddrSpace, Value *ArraySize,
                        const Twine &Name, Instruction *InsertBefore)
-    : AllocaInst(Ty, AddrSpace, ArraySize, /*Align=*/None, Name, InsertBefore) {
-}
+    : AllocaInst(Ty, AddrSpace, ArraySize,
+                 computeAllocaDefaultAlign(Ty, InsertBefore), Name,
+                 InsertBefore) {}
 
 AllocaInst::AllocaInst(Type *Ty, unsigned AddrSpace, Value *ArraySize,
                        const Twine &Name, BasicBlock *InsertAtEnd)
-    : AllocaInst(Ty, AddrSpace, ArraySize, /*Align=*/None, Name, InsertAtEnd) {}
+    : AllocaInst(Ty, AddrSpace, ArraySize,
+                 computeAllocaDefaultAlign(Ty, InsertAtEnd), Name,
+                 InsertAtEnd) {}
 
 AllocaInst::AllocaInst(Type *Ty, unsigned AddrSpace, Value *ArraySize,
-                       MaybeAlign Align, const Twine &Name,
+                       Align Align, const Twine &Name,
                        Instruction *InsertBefore)
     : UnaryInstruction(PointerType::get(Ty, AddrSpace), Alloca,
                        getAISize(Ty->getContext(), ArraySize), InsertBefore),
       AllocatedType(Ty) {
-  setAlignment(MaybeAlign(Align));
+  setAlignment(Align);
   assert(!Ty->isVoidTy() && "Cannot allocate void!");
   setName(Name);
 }
 
 AllocaInst::AllocaInst(Type *Ty, unsigned AddrSpace, Value *ArraySize,
-                       MaybeAlign Align, const Twine &Name,
-                       BasicBlock *InsertAtEnd)
+                       Align Align, const Twine &Name, BasicBlock *InsertAtEnd)
     : UnaryInstruction(PointerType::get(Ty, AddrSpace), Alloca,
                        getAISize(Ty->getContext(), ArraySize), InsertAtEnd),
       AllocatedType(Ty) {
@@ -1285,16 +1296,12 @@ AllocaInst::AllocaInst(Type *Ty, unsigned AddrSpace, Value *ArraySize,
   setName(Name);
 }
 
-void AllocaInst::setAlignment(MaybeAlign Align) {
-  assert((!Align || *Align <= MaximumAlignment) &&
+void AllocaInst::setAlignment(Align Align) {
+  assert(Align <= MaximumAlignment &&
          "Alignment is greater than MaximumAlignment!");
   setInstructionSubclassData((getSubclassDataFromInstruction() & ~31) |
                              encode(Align));
-  if (Align)
-    assert(getAlignment() == Align->value() &&
-           "Alignment representation error!");
-  else
-    assert(getAlignment() == 0 && "Alignment representation error!");
+  assert(getAlignment() == Align.value() && "Alignment representation error!");
 }
 
 bool AllocaInst::isArrayAllocation() const {
@@ -1326,12 +1333,12 @@ void LoadInst::AssertOK() {
          "Alignment required for atomic load");
 }
 
-Align computeLoadStoreDefaultAlign(Type *Ty, BasicBlock *BB) {
+static Align computeLoadStoreDefaultAlign(Type *Ty, BasicBlock *BB) {
   const DataLayout &DL = BB->getModule()->getDataLayout();
   return DL.getABITypeAlign(Ty);
 }
 
-Align computeLoadStoreDefaultAlign(Type *Ty, Instruction *I) {
+static Align computeLoadStoreDefaultAlign(Type *Ty, Instruction *I) {
   return computeLoadStoreDefaultAlign(Ty, I->getParent());
 }
 
@@ -2046,8 +2053,8 @@ static bool isSingleSourceMaskImpl(ArrayRef<int> Mask, int NumOpElts) {
     if (UsesLHS && UsesRHS)
       return false;
   }
-  assert((UsesLHS ^ UsesRHS) && "Should have selected from exactly 1 source");
-  return true;
+  // Allow for degenerate case: completely undef mask means neither source is used.
+  return UsesLHS || UsesRHS;
 }
 
 bool ShuffleVectorInst::isSingleSourceMask(ArrayRef<int> Mask) {
@@ -2175,6 +2182,8 @@ bool ShuffleVectorInst::isExtractSubvectorMask(ArrayRef<int> Mask,
 }
 
 bool ShuffleVectorInst::isIdentityWithPadding() const {
+  if (isa<UndefValue>(Op<2>()))
+    return false;
   int NumOpElts = cast<VectorType>(Op<0>()->getType())->getNumElements();
   int NumMaskElts = cast<VectorType>(getType())->getNumElements();
   if (NumMaskElts <= NumOpElts)
@@ -2194,8 +2203,16 @@ bool ShuffleVectorInst::isIdentityWithPadding() const {
 }
 
 bool ShuffleVectorInst::isIdentityWithExtract() const {
-  int NumOpElts = cast<VectorType>(Op<0>()->getType())->getNumElements();
-  int NumMaskElts = getType()->getNumElements();
+  if (isa<UndefValue>(Op<2>()))
+    return false;
+
+  // FIXME: Not currently possible to express a shuffle mask for a scalable
+  // vector for this case
+  if (isa<ScalableVectorType>(getType()))
+    return false;
+
+  int NumOpElts = cast<FixedVectorType>(Op<0>()->getType())->getNumElements();
+  int NumMaskElts = cast<FixedVectorType>(getType())->getNumElements();
   if (NumMaskElts >= NumOpElts)
     return false;
 
@@ -2204,7 +2221,8 @@ bool ShuffleVectorInst::isIdentityWithExtract() const {
 
 bool ShuffleVectorInst::isConcat() const {
   // Vector concatenation is differentiated from identity with padding.
-  if (isa<UndefValue>(Op<0>()) || isa<UndefValue>(Op<1>()))
+  if (isa<UndefValue>(Op<0>()) || isa<UndefValue>(Op<1>()) ||
+      isa<UndefValue>(Op<2>()))
     return false;
 
   int NumOpElts = cast<VectorType>(Op<0>()->getType())->getNumElements();
@@ -4240,7 +4258,7 @@ InsertValueInst *InsertValueInst::cloneImpl() const {
 AllocaInst *AllocaInst::cloneImpl() const {
   AllocaInst *Result =
       new AllocaInst(getAllocatedType(), getType()->getAddressSpace(),
-                     (Value *)getOperand(0), MaybeAlign(getAlignment()));
+                     getOperand(0), getAlign());
   Result->setUsedWithInAlloca(isUsedWithInAlloca());
   Result->setSwiftError(isSwiftError());
   return Result;

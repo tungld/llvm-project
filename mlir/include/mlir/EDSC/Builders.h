@@ -187,6 +187,8 @@ private:
 // trying to enter a Block that has already been constructed.
 class Append {};
 
+/// Deprecated. Use buildInNewBlock or appendToBlock instead.
+///
 /// A BlockBuilder is a NestedBuilder for mlir::Block*.
 /// This exists by opposition to LoopBuilder which is not related to an
 /// mlir::Block* but to a mlir::Value.
@@ -231,6 +233,8 @@ private:
   BlockBuilder &operator=(BlockBuilder &other) = delete;
 };
 
+/// Deprecated. Use Block * instead.
+///
 /// A BlockHandle represents a (potentially "delayed") Block abstraction.
 /// This extra abstraction is necessary because an mlir::Block is not an
 /// mlir::Value.
@@ -269,6 +273,35 @@ private:
   mlir::Block *block;
 };
 
+/// Creates a block in the region that contains the insertion block of the
+/// OpBuilder currently at the top of ScopedContext stack (appends the block to
+/// the region). Be aware that this will NOT update the insertion point of the
+/// builder to insert into the newly constructed block.
+Block *createBlock(TypeRange argTypes = llvm::None);
+
+/// Creates a block in the specified region using OpBuilder at the top of
+/// ScopedContext stack (appends the block to the region). Be aware that this
+/// will NOT update the insertion point of the builder to insert into the newly
+/// constructed block.
+Block *createBlockInRegion(Region &region, TypeRange argTypes = llvm::None);
+
+/// Calls "builderFn" with ScopedContext reconfigured to insert into "block" and
+/// passes in the block arguments. If the block has a terminator, the operations
+/// are inserted before the terminator, otherwise appended to the block.
+void appendToBlock(Block *block, function_ref<void(ValueRange)> builderFn);
+
+/// Creates a block in the region that contains the insertion block of the
+/// OpBuilder currently at the top of ScopedContext stack, and calls "builderFn"
+/// to populate the body of the block while passing it the block arguments.
+Block *buildInNewBlock(TypeRange argTypes,
+                       function_ref<void(ValueRange)> builderFn);
+
+/// Creates a block in the specified region using OpBuilder at the top of
+/// ScopedContext stack, and calls "builderFn" to populate the body of the block
+/// while passing it the block arguments.
+Block *buildInNewBlock(Region &region, TypeRange argTypes,
+                       function_ref<void(ValueRange)> builderFn);
+
 /// A StructuredIndexed represents an indexable quantity that is either:
 /// 1. a captured value, which is suitable for buffer and tensor operands, or;
 /// 2. a captured type, which is suitable for tensor return values.
@@ -303,7 +336,7 @@ struct StructuredIndexed {
            "MemRef, RankedTensor or Vector expected");
   }
 
-  bool hasValue() const { return value; }
+  bool hasValue() const { return (bool)value; }
   Value getValue() const {
     assert(value && "StructuredIndexed Value not set.");
     return value;
@@ -358,7 +391,22 @@ public:
   /// Emits a `load` when converting to a Value.
   operator Value() const { return Load(value, indices); }
 
+  /// Returns the base memref.
   Value getBase() const { return value; }
+
+  /// Returns the underlying memref.
+  MemRefType getMemRefType() const {
+    return value.getType().template cast<MemRefType>();
+  }
+
+  /// Returns the underlying MemRef elemental type cast as `T`.
+  template <typename T>
+  T getElementalTypeAs() const {
+    return value.getType()
+        .template cast<MemRefType>()
+        .getElementType()
+        .template cast<T>();
+  }
 
   /// Arithmetic operator overloadings.
   Value operator+(Value e);
